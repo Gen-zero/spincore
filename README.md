@@ -7,7 +7,7 @@ Spincore neurons provide a simple, differentiable substrate that can be
 trained on data and optionally interfaced with existing large language
 models (LLMs).
 
-##**Design goals**
+## **Design goals**
 
 1. **Minimal dependencies** – the code relies only on the Python standard
    library and NumPy.  Optional integrations with external frameworks such
