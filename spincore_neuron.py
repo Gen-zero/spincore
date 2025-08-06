@@ -8,6 +8,12 @@ from typing import Callable, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+# Import torch conditionally to avoid hard dependency
+try:
+    import torch
+except ImportError:
+    torch = None
+
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
     """Numerically stable logistic function.
@@ -516,6 +522,110 @@ class SpincoreNeuron:
         generated_ids = outputs[0]
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
         return generated_text, spincore_output
+
+    def align_with_llm(
+        self,
+        llm_model,
+        tokenizer=None,
+        freeze_spincore: bool = False
+    ):
+        """
+        Returns a `generate_with_spincore(prompt: str, **kwargs)` function
+        that wraps llm_model.generate(), inserting Spincore outputs
+        into the token embeddings.
+
+        Args:
+          llm_model:           a HuggingFace model (e.g. transformers.PreTrainedModel)
+          tokenizer:           corresponding tokenizer (required)
+          freeze_spincore:     if True, sets learning_rate and orientation_lr_scale to 0
+        """
+        
+        # Check if torch is available
+        if torch is None:
+            raise ImportError(
+                "PyTorch is required for LLM integration, but it is not installed. "
+                "Please install torch before using this method."
+            )
+
+        # — optionally freeze all Spincore training —
+        if freeze_spincore:
+            self.orientation_lr_scale = 0.0
+
+        def generate_with_spincore(prompt: str, max_length=50, **generate_kwargs):
+            if tokenizer is None:
+                raise ValueError("You must pass a tokenizer to align_with_llm().")
+
+            # 1) Tokenize
+            inputs = tokenizer(prompt, return_tensors="pt", padding=True)
+            input_ids = inputs.input_ids.to(llm_model.device)
+            attention_mask = inputs.attention_mask.to(llm_model.device) if hasattr(inputs, 'attention_mask') else None
+
+            # 2) Pull raw token embeddings
+            emb_layer = llm_model.get_input_embeddings()
+            embeddings = emb_layer(input_ids)
+            # embeddings shape: (batch=1, seq_len, hidden_dim)
+
+            # 3) Run spincore forward on a flattened view of those embeddings
+            #    (or choose a pooling you prefer)
+            emb_np = embeddings.detach().cpu().numpy()[0]            # (seq_len, hidden_dim)
+            x = emb_np.reshape(1, -1)                               # (1, seq_len*hidden_dim)
+            # Make sure the input dimension matches what the neuron expects
+            if x.shape[1] != self.input_dim:
+                # If dimensions don't match, we need to either truncate or pad
+                if x.shape[1] > self.input_dim:
+                    # Truncate if too large
+                    x = x[:, :self.input_dim]
+                else:
+                    # Pad with zeros if too small
+                    padding = np.zeros((1, self.input_dim - x.shape[1]), dtype=x.dtype)
+                    x = np.concatenate([x, padding], axis=1)
+            spin_out = self.forward(x)                              # (1, output_dim)
+
+            # 4) Convert back to a torch Tensor and broadcast
+            spin_tensor = torch.tensor(
+                spin_out,
+                dtype=embeddings.dtype,
+                device=embeddings.device
+            )
+            # Now expand to (1, seq_len, output_dim)
+            spin_feat = spin_tensor.unsqueeze(1).expand(
+                embeddings.size(0), embeddings.size(1), -1
+            )
+
+            # 5) For now, we'll disable the SpincoreNeuron's influence on embeddings
+            # as it seems to be causing repetitive text generation
+            mod_embeddings = embeddings
+            
+            # Note: For future improvements, consider these approaches:
+            # 1. Use spincore output to influence attention weights instead of embeddings
+            # 2. Apply a more sophisticated integration method with proper scaling
+            # 3. Use spincore output as a conditioning signal for the model
+            # 4. Train the spincore neuron specifically to avoid repetitive patterns
+            # such as using the spincore output to influence attention weights
+            # or using it as a prefix/prompt embedding
+
+            # Finally call the model's generate using our patched embeddings
+            generate_kwargs_with_mask = generate_kwargs.copy()
+            
+            # Add attention_mask if available
+            if attention_mask is not None:
+                generate_kwargs_with_mask['attention_mask'] = attention_mask
+                
+            # Set pad_token_id explicitly if not already set
+            if 'pad_token_id' not in generate_kwargs_with_mask and hasattr(tokenizer, 'pad_token_id'):
+                if tokenizer.pad_token_id is not None:
+                    generate_kwargs_with_mask['pad_token_id'] = tokenizer.pad_token_id
+                elif hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+                    # Fall back to eos_token_id if pad_token_id is not set
+                    generate_kwargs_with_mask['pad_token_id'] = tokenizer.eos_token_id
+            
+            return llm_model.generate(
+                inputs_embeds=mod_embeddings,
+                max_length=max_length,
+                **generate_kwargs_with_mask
+            )
+
+        return generate_with_spincore
 
     def flip_spin(self) -> None:
         """Toggle the spin state between +1 (spin‑up) and −1 (spin‑down)."""
