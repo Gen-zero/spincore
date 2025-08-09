@@ -1,3 +1,43 @@
+"""
+Spincore Neuron – version 1.0
+===============================
+
+This module defines a first–pass implementation of a *Spincore* neuron and
+associated training routines.  The aim of the Spincore concept is to form
+the backbone of an aligned general intelligence (AGI) architecture without
+making assumptions about any particular downstream model.  In practice
+Spincore neurons provide a simple, differentiable substrate that can be
+trained on data and optionally interfaced with existing large language
+models (LLMs).
+
+**Design goals**
+
+1. **Minimal dependencies** – the code relies only on the Python standard
+   library and NumPy.  Optional integrations with external frameworks such
+   as PyTorch or HuggingFace are provided behind feature‐checks.  If those
+   libraries are unavailable, the core of Spincore continues to work.
+2. **Transparency** – weights, orientation vectors and spin state are all
+   explicit and can be inspected or saved for later analysis.  There are
+   no hidden globals or side effects.
+3. **Flexibility** – the neuron can be trained in supervised, self‑supervised
+   or reinforcement settings.  Additional layers of training logic can be
+   built on top of the provided primitives without modifying the core
+   implementation.
+4. **Compatibility** – where possible the class exposes hooks for feeding
+   Spincore activations into other neural architectures.  The
+   ``integrate_with_llm`` method illustrates how to pass Spincore outputs
+   as prefixes or prompts to a language model if such a model is
+   available.
+
+This file is deliberately self‑contained so that it can be dropped into
+other projects without dragging along a large dependency tree.  It is not
+meant to be the final implementation; rather, it lays the groundwork for
+future research into aligned and interpretable neural components.
+
+Author: OpenAI Assistant
+Date: 2025‑08‑04 (Asia/Kolkata timezone)
+"""
+
 from __future__ import annotations
 
 import math
@@ -7,12 +47,6 @@ from dataclasses import dataclass, field
 from typing import Callable, Iterable, List, Optional, Tuple
 
 import numpy as np
-
-# Import torch conditionally to avoid hard dependency
-try:
-    import torch
-except ImportError:
-    torch = None
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -525,105 +559,281 @@ class SpincoreNeuron:
 
     def align_with_llm(
         self,
-        llm_model,
-        tokenizer=None,
-        freeze_spincore: bool = False
+        llm_model: object,
+        tokenizer: Optional[object] = None,
+        freeze_spincore: bool = False,
+        mode: str = "logits",
+        spiron_network: Optional[object] = None,
+        scale: float = 0.05,
+        soft_tokens: int = 5,
+        repetition_penalty: float = 1.15,
+        no_repeat_ngram_size: int = 3,
     ):
-        """
-        Returns a `generate_with_spincore(prompt: str, **kwargs)` function
-        that wraps llm_model.generate(), inserting Spincore outputs
-        into the token embeddings.
+        """Return a text generation function that modulates an LLM with Spincore/Spiron output.
+
+        This method constructs a closure around an underlying language model
+        and returns a function ``generate_with_spincore``.  The returned
+        function accepts a prompt and optional generation parameters and
+        produces a sequence of token ids from the language model.  Prior
+        to generation, it computes a control vector either from this
+        Spincore neuron or from a provided Spiron network.  The control
+        vector is then injected into the model according to the selected
+        ``mode``:
+
+        * ``"logits"`` – the control vector is projected into a bias on
+          the vocabulary logits via a custom logits processor.  This
+          approach influences token selection directly and is robust
+          against repetitive outputs when combined with standard anti‑
+          repetition processors.
+        * ``"soft_prompt"`` – the control vector is mapped into a small
+          set of "soft" prompt tokens and prepended to the input
+          embeddings.  This conditions the model similarly to prefix
+          tuning.
+        * ``"embedding"`` – fallback to a basic embedding modulation
+          similar to the original ``integrate_with_llm`` (discouraged).
 
         Args:
-          llm_model:           a HuggingFace model (e.g. transformers.PreTrainedModel)
-          tokenizer:           corresponding tokenizer (required)
-          freeze_spincore:     if True, sets learning_rate and orientation_lr_scale to 0
-        """
-        
-        # Check if torch is available
-        if torch is None:
-            raise ImportError(
-                "PyTorch is required for LLM integration, but it is not installed. "
-                "Please install torch before using this method."
-            )
+            llm_model: A HuggingFace causal language model supporting
+                ``generate``.
+            tokenizer: A corresponding tokenizer.  If ``None``, the
+                model's own tokenizer will be loaded via its config.
+            freeze_spincore: If True, freezes the neuron's orientation
+                updates by setting ``orientation_lr_scale`` to zero.
+            mode: Integration mode ("logits", "soft_prompt", or "embedding").
+            spiron_network: Optional instance of ``SpironNetwork`` whose
+                spin outputs will replace the neuron's own output.  If
+                provided, the network's ``update`` and ``get_output``
+                methods are used to compute the control vector.
+            scale: Scaling factor applied to the projected control bias
+                when ``mode='logits'``.
+            soft_tokens: Number of soft prompt tokens when
+                ``mode='soft_prompt'``.
+            repetition_penalty: Penalty factor for repetition in the
+                generated text.  Passed to
+                ``RepetitionPenaltyLogitsProcessor``.
+            no_repeat_ngram_size: Size of n‑grams to disallow repetition
+                via ``NoRepeatNGramLogitsProcessor``.
 
-        # — optionally freeze all Spincore training —
+        Returns:
+            A callable ``generate_with_spincore(prompt: str, **generate_kwargs)``
+            that produces model outputs when invoked.
+
+        Raises:
+            ImportError: If required packages (torch, transformers) are
+                not installed.
+            ValueError: If an invalid mode is specified or the
+                integration fails.
+        """
+        # Lazy imports and availability checks
+        try:
+            import torch  # type: ignore
+        except Exception as exc:
+            raise ImportError(
+                "PyTorch is required for LLM integration, but it is not installed."
+            ) from exc
+        try:
+            from transformers import (
+                LogitsProcessor,
+                LogitsProcessorList,
+                RepetitionPenaltyLogitsProcessor,
+                NoRepeatNGramLogitsProcessor,
+            )  # type: ignore
+        except Exception as exc:
+            raise ImportError(
+                "HuggingFace transformers is required for LLM integration, but it is not installed."
+            ) from exc
+
+        # Freeze orientation updates if requested
         if freeze_spincore:
             self.orientation_lr_scale = 0.0
 
-        def generate_with_spincore(prompt: str, max_length=50, **generate_kwargs):
-            if tokenizer is None:
-                raise ValueError("You must pass a tokenizer to align_with_llm().")
+        # Resolve tokenizer if not provided
+        if tokenizer is None:
+            try:
+                from transformers import AutoTokenizer  # type: ignore
+                tokenizer = AutoTokenizer.from_pretrained(llm_model.config._name_or_path)
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to load tokenizer. Please supply a tokenizer explicitly."
+                ) from exc
 
-            # 1) Tokenize
-            inputs = tokenizer(prompt, return_tensors="pt", padding=True)
-            input_ids = inputs.input_ids.to(llm_model.device)
-            attention_mask = inputs.attention_mask.to(llm_model.device) if hasattr(inputs, 'attention_mask') else None
+        # Determine control dimension
+        control_dim: int
+        if spiron_network is not None:
+            # The control vector dimension equals the number of nodes
+            control_dim = len(spiron_network)
+        else:
+            control_dim = self.output_dim
 
-            # 2) Pull raw token embeddings
-            emb_layer = llm_model.get_input_embeddings()
-            embeddings = emb_layer(input_ids)
-            # embeddings shape: (batch=1, seq_len, hidden_dim)
+        # Precompute projection matrix for logits mode
+        proj_matrix: Optional[torch.Tensor] = None
+        vocab_size = llm_model.config.vocab_size
+        if mode == "logits":
+            # Initialise a small random projection from control space to vocab
+            rng = np.random.default_rng(0)
+            W = rng.normal(0.0, 0.02, size=(control_dim, vocab_size)).astype(np.float32)
+            proj_matrix = torch.tensor(W, device=llm_model.device)
 
-            # 3) Run spincore forward on a flattened view of those embeddings
-            #    (or choose a pooling you prefer)
-            emb_np = embeddings.detach().cpu().numpy()[0]            # (seq_len, hidden_dim)
-            x = emb_np.reshape(1, -1)                               # (1, seq_len*hidden_dim)
-            # Make sure the input dimension matches what the neuron expects
-            if x.shape[1] != self.input_dim:
-                # If dimensions don't match, we need to either truncate or pad
-                if x.shape[1] > self.input_dim:
-                    # Truncate if too large
-                    x = x[:, :self.input_dim]
-                else:
-                    # Pad with zeros if too small
-                    padding = np.zeros((1, self.input_dim - x.shape[1]), dtype=x.dtype)
-                    x = np.concatenate([x, padding], axis=1)
-            spin_out = self.forward(x)                              # (1, output_dim)
+        def generate_with_spincore(prompt: str, max_new_tokens: int = 50, **generate_kwargs):
+            """Generate text from the LLM with Spincore/Spiron modulation.
 
-            # 4) Convert back to a torch Tensor and broadcast
-            spin_tensor = torch.tensor(
-                spin_out,
-                dtype=embeddings.dtype,
-                device=embeddings.device
-            )
-            # Now expand to (1, seq_len, output_dim)
-            spin_feat = spin_tensor.unsqueeze(1).expand(
-                embeddings.size(0), embeddings.size(1), -1
-            )
+            Args:
+                prompt: Input prompt provided by the user.
+                max_new_tokens: Maximum number of new tokens to generate.
+                **generate_kwargs: Additional keyword arguments forwarded
+                    to the model's ``generate`` method.  These can
+                    include sampling parameters such as ``do_sample``,
+                    ``top_p`` and ``temperature``.
 
-            # 5) For now, we'll disable the SpincoreNeuron's influence on embeddings
-            # as it seems to be causing repetitive text generation
-            mod_embeddings = embeddings
-            
-            # Note: For future improvements, consider these approaches:
-            # 1. Use spincore output to influence attention weights instead of embeddings
-            # 2. Apply a more sophisticated integration method with proper scaling
-            # 3. Use spincore output as a conditioning signal for the model
-            # 4. Train the spincore neuron specifically to avoid repetitive patterns
-            # such as using the spincore output to influence attention weights
-            # or using it as a prefix/prompt embedding
-
-            # Finally call the model's generate using our patched embeddings
-            generate_kwargs_with_mask = generate_kwargs.copy()
-            
-            # Add attention_mask if available
+            Returns:
+                A tensor of generated token IDs.
+            """
+            # Tokenise prompt
+            inputs = tokenizer(prompt, return_tensors="pt")
+            input_ids = inputs["input_ids"].to(llm_model.device)
+            attention_mask = inputs.get("attention_mask")
             if attention_mask is not None:
-                generate_kwargs_with_mask['attention_mask'] = attention_mask
-                
-            # Set pad_token_id explicitly if not already set
-            if 'pad_token_id' not in generate_kwargs_with_mask and hasattr(tokenizer, 'pad_token_id'):
-                if tokenizer.pad_token_id is not None:
-                    generate_kwargs_with_mask['pad_token_id'] = tokenizer.pad_token_id
-                elif hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
-                    # Fall back to eos_token_id if pad_token_id is not set
-                    generate_kwargs_with_mask['pad_token_id'] = tokenizer.eos_token_id
-            
-            return llm_model.generate(
-                inputs_embeds=mod_embeddings,
-                max_length=max_length,
-                **generate_kwargs_with_mask
-            )
+                attention_mask = attention_mask.to(llm_model.device)
+
+            # Compute control vector
+            if spiron_network is not None:
+                # Update network to reflect current time
+                try:
+                    spiron_network.update()
+                except Exception:
+                    pass
+                ctrl_np = spiron_network.get_output(as_float=True)[0]  # shape: (control_dim,)
+            else:
+                # Derive a meaningful vector from the current embeddings:
+                # flatten the embeddings of the prompt into a single vector
+                emb_layer = llm_model.get_input_embeddings()
+                embeddings = emb_layer(input_ids)  # (1, seq_len, hidden)
+                emb_np = embeddings.detach().cpu().numpy()[0]
+                flat = emb_np.reshape(1, -1)  # (1, seq_len*hidden)
+                # Truncate or pad to match input_dim
+                if flat.shape[1] != self.input_dim:
+                    if flat.shape[1] > self.input_dim:
+                        flat = flat[:, : self.input_dim]
+                    else:
+                        pad = np.zeros((1, self.input_dim - flat.shape[1]), dtype=flat.dtype)
+                        flat = np.concatenate([flat, pad], axis=1)
+                # Pass through spincore neuron
+                spin_out = self.forward(flat)  # (1, output_dim)
+                ctrl_np = spin_out[0]
+
+            # Zero‑mean and unit‑norm the control vector
+            ctrl_mean = np.mean(ctrl_np)
+            ctrl_zero = ctrl_np - ctrl_mean
+            ctrl_norm = np.linalg.norm(ctrl_zero) + 1e-8
+            ctrl_unit = ctrl_zero / ctrl_norm
+
+            # Select integration strategy
+            if mode == "logits":
+                # Define a custom logits processor capturing the control vector
+                class _SpincoreLogitsProcessor(LogitsProcessor):  # type: ignore
+                    def __call__(self, input_ids_t: torch.LongTensor, scores_t: torch.FloatTensor) -> torch.FloatTensor:
+                        # Convert the unit control vector to a torch tensor
+                        bias = torch.tensor(ctrl_unit, dtype=scores_t.dtype, device=scores_t.device) @ proj_matrix  # type: ignore
+                        return scores_t + float(scale) * bias
+
+                processors = LogitsProcessorList()
+                # Append our processor first
+                processors.append(_SpincoreLogitsProcessor())
+                # Anti‑repetition processors
+                if repetition_penalty is not None and repetition_penalty > 1.0:
+                    processors.append(RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty))
+                if no_repeat_ngram_size is not None and no_repeat_ngram_size > 0:
+                    processors.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram_size))
+
+                # Prepare generation kwargs
+                gen_kwargs = generate_kwargs.copy()
+                # Set max_new_tokens if not provided
+                if "max_new_tokens" not in gen_kwargs and "max_length" not in gen_kwargs:
+                    gen_kwargs["max_new_tokens"] = max_new_tokens
+                # Add attention mask if available
+                if attention_mask is not None:
+                    gen_kwargs["attention_mask"] = attention_mask
+                # Set pad_token_id if needed
+                if "pad_token_id" not in gen_kwargs and hasattr(tokenizer, "pad_token_id"):
+                    pad_id = tokenizer.pad_token_id
+                    # fall back to eos_token_id if pad_token_id is None
+                    if pad_id is None and hasattr(tokenizer, "eos_token_id"):
+                        pad_id = tokenizer.eos_token_id
+                    if pad_id is not None:
+                        gen_kwargs["pad_token_id"] = pad_id
+                # Perform generation with logits processors
+                outputs = llm_model.generate(input_ids=input_ids, logits_processor=processors, **gen_kwargs)
+                return outputs
+
+            elif mode == "soft_prompt":
+                # Map control vector to a sequence of soft prompt tokens
+                # Determine hidden size
+                hidden_size = llm_model.config.hidden_size
+                # Create a simple projection from control vector to soft prompt
+                # of shape (soft_tokens, hidden_size).  Initialise projection on
+                # first call and reuse thereafter via closure attribute.
+                # initialise projection matrix if absent
+                if not hasattr(generate_with_spincore, "_soft_proj"):
+                    rng = np.random.default_rng(42)
+                    weight = rng.normal(0.0, 0.02, size=(control_dim, soft_tokens * hidden_size)).astype(np.float32)
+                    setattr(generate_with_spincore, "_soft_proj", torch.tensor(weight, device=llm_model.device))
+                soft_proj: torch.Tensor = getattr(generate_with_spincore, "_soft_proj")
+                # project control vector to soft embeddings
+                ctrl_tensor = torch.tensor(ctrl_unit, dtype=torch.float32, device=llm_model.device)
+                soft_vec = ctrl_tensor @ soft_proj  # shape: (soft_tokens * hidden_size,)
+                soft_vec = soft_vec.view(soft_tokens, hidden_size)  # (K, H)
+                # Get input embeddings for prompt
+                base_emb = llm_model.get_input_embeddings()(input_ids)
+                # Concatenate soft prompt at the beginning
+                inputs_embeds = torch.cat([
+                    soft_vec.unsqueeze(0),  # (1, K, H)
+                    base_emb
+                ], dim=1)
+                # Construct attention mask
+                if attention_mask is not None:
+                    soft_mask = torch.ones((1, soft_tokens), dtype=attention_mask.dtype, device=attention_mask.device)
+                    new_attention_mask = torch.cat([soft_mask, attention_mask], dim=1)
+                else:
+                    new_attention_mask = None
+                # Prepare generation kwargs
+                gen_kwargs = generate_kwargs.copy()
+                if "max_new_tokens" not in gen_kwargs and "max_length" not in gen_kwargs:
+                    gen_kwargs["max_new_tokens"] = max_new_tokens
+                # Set pad_token_id if needed
+                if "pad_token_id" not in gen_kwargs and hasattr(tokenizer, "pad_token_id"):
+                    pad_id = tokenizer.pad_token_id
+                    if pad_id is None and hasattr(tokenizer, "eos_token_id"):
+                        pad_id = tokenizer.eos_token_id
+                    if pad_id is not None:
+                        gen_kwargs["pad_token_id"] = pad_id
+                # Generate with embeddings
+                outputs = llm_model.generate(inputs_embeds=inputs_embeds, attention_mask=new_attention_mask, **gen_kwargs)
+                return outputs
+
+            elif mode == "embedding":
+                # Fallback: basic embedding modulation (discouraged)
+                # Append the control vector as an extra pseudo‑token at the end
+                hidden_size = llm_model.config.hidden_size
+                # pad or truncate control vector to hidden size
+                embed_np = np.zeros((hidden_size,), dtype=np.float32)
+                length = min(hidden_size, control_dim)
+                embed_np[:length] = ctrl_unit[:length]
+                embed_tensor = torch.tensor(embed_np, dtype=torch.float32, device=llm_model.device)
+                # Get base embeddings
+                base_emb = llm_model.get_input_embeddings()(input_ids)
+                # Concatenate pseudo‑token
+                ext_emb = torch.cat([base_emb, embed_tensor.unsqueeze(0).unsqueeze(0)], dim=1)
+                # Prepare kwargs
+                gen_kwargs = generate_kwargs.copy()
+                if "max_new_tokens" not in gen_kwargs and "max_length" not in gen_kwargs:
+                    gen_kwargs["max_new_tokens"] = max_new_tokens
+                if attention_mask is not None:
+                    pseudo_mask = torch.ones((1, 1), dtype=attention_mask.dtype, device=attention_mask.device)
+                    gen_kwargs["attention_mask"] = torch.cat([attention_mask, pseudo_mask], dim=1)
+                outputs = llm_model.generate(inputs_embeds=ext_emb, **gen_kwargs)
+                return outputs
+            else:
+                raise ValueError(f"Unknown integration mode: {mode}")
 
         return generate_with_spincore
 
